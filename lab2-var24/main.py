@@ -1,463 +1,642 @@
 import argparse
 import csv
-import requests
+import json
 import os
-import time
 import random
 import re
+import sys
+import time
+import traceback
+from typing import List, Dict, Optional, Tuple, Iterator
 from urllib.parse import urljoin
+
+import requests
 from bs4 import BeautifulSoup
 
 
-def parse_arguments():
-    """Парсинг аргументов командной строки"""
+class FileIterator:
+    """Итератор для перебора MP3 файлов в директории."""
+    
+    def __init__(self, dir_path: str) -> None:
+        """
+        Инициализация итератора.
+        
+        Args:
+            dir_path: Путь к директории с файлами
+        """
+        self.dir_path = os.path.abspath(dir_path)
+        if not os.path.exists(self.dir_path):
+            os.makedirs(self.dir_path, exist_ok=True)
+        
+        # Собираем список MP3 файлов
+        self.file_list: List[str] = []
+        if os.path.exists(self.dir_path):
+            for file_name in os.listdir(self.dir_path):
+                if file_name.lower().endswith('.mp3'):
+                    self.file_list.append(os.path.join(self.dir_path, file_name))
+        
+        self.index = 0
+        self.total_files = len(self.file_list)
+        
+    def __iter__(self) -> Iterator[str]:
+        """Возвращает итератор."""
+        return self
+    
+    def __next__(self) -> str:
+        """Возвращает следующий MP3 файл."""
+        if self.index < self.total_files:
+            file_path = self.file_list[self.index]
+            self.index += 1
+            return file_path
+        raise StopIteration
+    
+    def __len__(self) -> int:
+        """Возвращает количество MP3 файлов."""
+        return self.total_files
+    
+    def reset(self) -> None:
+        """Сброс итератора."""
+        self.index = 0
+
+
+def parse_args() -> argparse.Namespace:
+    """
+    Парсинг аргументов командной строки.
+    
+    Returns:
+        Пространство имен с аргументами
+    """
     parser = argparse.ArgumentParser(
-        description="Скачивание музыки с mixkit.co по жанрам (country, funk, classical)"
+        description='Скачивание музыки с Mixkit по жанрам: country, funk, classical'
     )
     parser.add_argument(
-        "--download-folder",
-        "-d",
+        '--output_dir',
+        '-o',
         required=True,
-        help="Папка для сохранения аудиофайлов",
+        help='Папка для сохранения всех треков'
     )
     parser.add_argument(
-        "--annotation-file",
-        "-a",
-        default="annotation.csv",
-        help="Путь к файлу аннотации CSV (по умолчанию: annotation.csv)",
+        '--csv_path',
+        '-c',
+        default='music_annotation.csv',
+        help='Путь к выходному CSV-файлу (по умолчанию: music_annotation.csv)'
     )
     parser.add_argument(
-        "--min-files", type=int, default=50, help="Минимальное количество файлов"
+        '--min_files',
+        type=int,
+        default=50,
+        help='Минимальное количество файлов для скачивания (по умолчанию: 50)'
     )
     parser.add_argument(
-        "--max-files", type=int, default=100, help="Максимальное количество файлов"
+        '--max_files',
+        type=int,
+        default=100,
+        help='Максимальное количество файлов для скачивания (по умолчанию: 100)'
     )
-
+    parser.add_argument(
+        '--max_pages',
+        type=int,
+        default=3,
+        help='Максимальное количество страниц для парсинга на жанр (по умолчанию: 3)'
+    )
+    
     args = parser.parse_args()
-
+    
     # Валидация аргументов
-    if not (50 <= args.max_files <= 1000):
-        parser.error("--max-files должно быть от 50 до 1000")
-    if args.min_files > args.max_files:
-        parser.error("--min-files не может быть больше --max-files")
-
+    if args.min_files < 1:
+        parser.error('--min_files должно быть больше 0')
+    if args.max_files < args.min_files:
+        parser.error('--max_files должно быть больше или равно --min_files')
+    if args.max_pages < 1:
+        parser.error('--max_pages должно быть больше 0')
+    
     return args
 
 
-class MusicDownloader:
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
-            }
-        )
-        self.base_url = "https://mixkit.co"
+def csv_init(csv_path: str) -> None:
+    """
+    Создаёт CSV-файл с заголовком.
+    
+    Args:
+        csv_path: Путь к CSV файлу
+    """
+    try:
+        # Создаем директорию для CSV файла, если она не существует
+        csv_dir = os.path.dirname(csv_path)
+        if csv_dir and not os.path.exists(csv_dir):
+            os.makedirs(csv_dir, exist_ok=True)
+        
+        csv_header = ["genre", "abs_path", "rel_path", "url", "filename", "duration"]
+        with open(csv_path, 'w', encoding="utf-8", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(csv_header)
+        print(f"Создан CSV файл: {csv_path}")
+    except IOError as e:
+        print(f"Ошибка создания CSV файла {csv_path}: {e}")
+        raise
 
-        # Жанры для варианта 24
-        self.genres = ["country", "funk", "classical"]
-        
-        # Страницы с музыкой по жанрам (на основе структуры сайта)
-        self.genre_urls = {
-            "country": "/free-stock-music/country/",
-            "funk": "/free-stock-music/funk/",
-            "classical": "/free-stock-music/classical/"
-        }
 
-    def get_music_pages_from_genre(self, genre, url, max_pages=3):
-        """Получить страницы с музыкой из определенного жанра"""
-        music_pages = []
+def append_to_csv(csv_path: str, csv_data: List[List[str]]) -> None:
+    """
+    Добавляет строки в CSV-файл.
+    
+    Args:
+        csv_path: Путь к CSV файлу
+        csv_data: Список строк для записи
+    """
+    try:
+        with open(csv_path, 'a', encoding="utf-8", newline="") as file:
+            writer = csv.writer(file)
+            for row in csv_data:
+                writer.writerow(row)
+    except IOError as e:
+        print(f"Ошибка записи в CSV файл {csv_path}: {e}")
+        raise
+
+
+def generate_url(genre: str, page: int = 1) -> str:
+    """
+    Создаёт ссылку на страницу жанра в Mixkit.
+    
+    Args:
+        genre: Название жанра
+        page: Номер страницы (по умолчанию: 1)
+    
+    Returns:
+        URL страницы жанра
+    """
+    base_url = f"https://mixkit.co/free-stock-music/{genre}/"
+    if page > 1:
+        return f"{base_url}?page={page}"
+    return base_url
+
+
+def get_html(url: str) -> Optional[str]:
+    """
+    Получает HTML страницы с обработкой ошибок.
+    
+    Args:
+        url: URL страницы
+    
+    Returns:
+        HTML содержимое или None в случае ошибки
+    """
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+    
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
         
-        print(f"Поиск музыки в жанре: {genre}")
-        
-        for page in range(1, max_pages + 1):
-            page_url = url
-            if page > 1:
-                page_url = f"{url.rstrip('/')}/?page={page}"
+        # Проверяем, что это HTML страница
+        if 'text/html' in resp.headers.get('Content-Type', ''):
+            return resp.text
+        else:
+            print(f"Неожиданный Content-Type: {resp.headers.get('Content-Type')}")
+            return None
             
-            print(f"  Страница {page}: {page_url}")
-            
-            try:
-                response = self.session.get(self.base_url + page_url, timeout=10)
-                response.raise_for_status()
-                soup = BeautifulSoup(response.text, "html.parser")
-                
-                # Поиск ссылок на отдельные треки
-                # На Mixkit ссылки на музыку обычно содержат "/free-stock-music/жанр/название-трека-123/"
-                track_links = soup.find_all("a", href=re.compile(r"/free-stock-music/[^/]+/[^/]+/$"))
-                
-                for link in track_links:
-                    href = link["href"]
-                    if href.startswith("/free-stock-music/"):
-                        full_url = urljoin(self.base_url, href)
-                        if full_url not in music_pages:
-                            music_pages.append(full_url)
-                            print(f"    Найдена страница трека: {os.path.basename(href)}")
-                
-                # Проверяем наличие следующей страницы
-                next_button = soup.find("a", class_="pagination__item--next")
-                if not next_button and page >= 2:
-                    break
-                    
-                time.sleep(random.uniform(1, 2))
-                
-            except requests.RequestException as e:
-                print(f"    Ошибка при загрузке страницы {page_url}: {e}")
-                break
-            except Exception as e:
-                print(f"    Ошибка при парсинге страницы {page_url}: {e}")
-                break
-        
-        print(f"  Найдено треков в жанре {genre}: {len(music_pages)}")
-        return music_pages
+    except requests.exceptions.Timeout:
+        print(f"Таймаут при загрузке страницы: {url}")
+    except requests.exceptions.HTTPError as e:
+        print(f"HTTP ошибка при загрузке {url}: {e}")
+    except requests.exceptions.RequestException as e:
+        print(f"Ошибка сети при загрузке {url}: {e}")
+    except Exception as e:
+        print(f"Неожиданная ошибка при загрузке {url}: {e}")
+    
+    return None
 
-    def get_music_pages(self):
-        """Получить страницы с музыкой из трех жанров (country, funk, classical)"""
-        all_music_pages = []
-        
-        for genre in self.genres:
-            if genre in self.genre_urls:
-                genre_pages = self.get_music_pages_from_genre(genre, self.genre_urls[genre])
-                all_music_pages.extend(genre_pages)
-        
-        # Перемешиваем, чтобы получить случайное распределение
-        random.shuffle(all_music_pages)
-        return all_music_pages
 
-    def distribute_files_by_genre(self, total_files, min_per_genre=1):
-        """Распределить общее количество файлов по жанрам случайным образом"""
-        # Гарантируем минимум по 1 файлу на каждый жанр
-        base_distribution = {genre: min_per_genre for genre in self.genres}
-        remaining_files = total_files - (min_per_genre * len(self.genres))
-        
-        if remaining_files > 0:
-            # Распределяем оставшиеся файлы случайным образом
-            weights = [random.random() for _ in self.genres]
-            total_weight = sum(weights)
-            
-            for i, genre in enumerate(self.genres):
-                additional = int(remaining_files * (weights[i] / total_weight))
-                base_distribution[genre] += additional
-            
-            # Корректировка на случай округления
-            total_allocated = sum(base_distribution.values())
-            if total_allocated < total_files:
-                genre_idx = random.randint(0, len(self.genres) - 1)
-                base_distribution[self.genres[genre_idx]] += total_files - total_allocated
-        
-        print(f"\nРаспределение файлов по жанрам:")
-        for genre, count in base_distribution.items():
-            print(f"  {genre}: {count} файлов")
-        
-        return base_distribution
-
-    def parse_duration(self, duration_str):
-        """Преобразует строку длительности в секунды"""
-        if not duration_str:
-            return 0
-
-        duration_str = duration_str.strip()
-        duration_str = re.sub(r"\s+", "", duration_str)
-
-        # Формат "0:01" или "1:23"
-        if ":" in duration_str:
-            parts = duration_str.split(":")
-            if len(parts) == 2:
-                try:
-                    minutes = int(parts[0])
-                    seconds = int(parts[1])
-                    return minutes * 60 + seconds
-                except ValueError:
-                    return 0
-            elif len(parts) == 3:
-                try:
-                    hours = int(parts[0])
-                    minutes = int(parts[1])
-                    seconds = int(parts[2])
-                    return hours * 3600 + minutes * 60 + seconds
-                except ValueError:
-                    return 0
-
-        # Пытаемся найти числа в строке
-        numbers = re.findall(r"\d+", duration_str)
-        if numbers:
-            if len(numbers) == 1:
-                return int(numbers[0])
-            elif len(numbers) == 2:
-                return int(numbers[0]) * 60 + int(numbers[1])
-            elif len(numbers) == 3:
-                return int(numbers[0]) * 3600 + int(numbers[1]) * 60 + int(numbers[2])
-
-        return 0
-
-    def get_duration_and_audio_url(self, page_url):
-        """Извлекает длительность и аудио URL со страницы музыки"""
+def mp3_parse(html: str) -> List[str]:
+    """
+    Парсит HTML и извлекает ссылки на MP3 файлы.
+    
+    Args:
+        html: HTML содержимое страницы
+    
+    Returns:
+        Список URL MP3 файлов
+    """
+    if not html:
+        return []
+    
+    urls: List[str] = []
+    soup = BeautifulSoup(html, 'html.parser')
+    
+    # Способ 1: Парсинг JSON-LD скриптов
+    for script in soup.find_all('script', type='application/ld+json'):
         try:
-            response = self.session.get(page_url, timeout=10)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, "html.parser")
+            data = json.loads(script.string or '{}')
+            js = json.dumps(data)
+            found = re.findall(r'https://assets\.mixkit\.co/[^\s"\']+\.mp3', js)
+            urls.extend(found)
+        except json.JSONDecodeError:
+            continue
+    
+    # Способ 2: Поиск ссылок в audio тегах
+    for audio_tag in soup.find_all('audio'):
+        if audio_tag.get('src'):
+            src = audio_tag['src']
+            if src.endswith('.mp3'):
+                urls.append(src)
+    
+    # Способ 3: Поиск ссылок с классом download-button
+    for link in soup.find_all('a', href=True):
+        href = link['href']
+        if href.endswith('.mp3') and 'mixkit' in href:
+            if not href.startswith('http'):
+                href = urljoin('https://mixkit.co', href)
+            urls.append(href)
+    
+    # Удаляем дубликаты и сортируем для стабильности
+    unique_urls = list(dict.fromkeys(urls))
+    return sorted(unique_urls)
 
-            # Ищем длительность
-            duration_elem = soup.find("div", class_="item-grid-card-audio__duration")
-            if not duration_elem:
-                duration_elem = soup.find("span", class_="audio-player__time-total")
-            if not duration_elem:
-                duration_elem = soup.find("div", {"data-test-id": "duration"})
 
-            duration_sec = 0
-            if duration_elem:
-                duration_text = duration_elem.get_text(strip=True)
-                duration_sec = self.parse_duration(duration_text)
-                print(f"    Длительность: {duration_text} -> {duration_sec} сек")
+def random_urls(urls: List[str], min_count: int = 1, max_count: int = 10) -> List[str]:
+    """
+    Выбирает случайное количество ссылок из списка.
+    
+    Args:
+        urls: Список URL
+        min_count: Минимальное количество ссылок для выбора
+        max_count: Максимальное количество ссылок для выбора
+    
+    Returns:
+        Случайный подсписок URL
+    """
+    if not urls:
+        return []
+    
+    # Ограничиваем максимальное количество доступными ссылками
+    available_count = len(urls)
+    max_possible = min(max_count, available_count)
+    min_possible = min(min_count, available_count)
+    
+    if min_possible > max_possible:
+        min_possible = max_possible
+    
+    # Выбираем случайное количество в заданном диапазоне
+    n = random.randint(min_possible, max_possible)
+    
+    # Возвращаем случайные ссылки
+    return random.sample(urls, n)
 
-            # Ищем аудио URL
-            audio_url = None
-            
-            # Способ 1: из data-атрибута
-            audio_div = soup.find("div", {"data-audio-player-preview-url-value": True})
-            if audio_div:
-                audio_url = audio_div.get("data-audio-player-preview-url-value")
-            
-            # Способ 2: из audio тега
-            if not audio_url:
-                audio_tag = soup.find("audio")
-                if audio_tag and audio_tag.get("src"):
-                    audio_url = audio_tag["src"]
-            
-            # Способ 3: из ссылки с классом
-            if not audio_url:
-                audio_link = soup.find("a", class_="audio-player__download-button")
-                if audio_link and audio_link.get("href"):
-                    audio_url = audio_link["href"]
-            
-            if audio_url and not audio_url.startswith("http"):
-                audio_url = urljoin(self.base_url, audio_url)
 
-            return duration_sec, audio_url
-
-        except Exception as e:
-            print(f"Ошибка извлечения данных со страницы {page_url}: {e}")
-            return 0, None
-
-    def download_music_from_page(self, page_url, download_folder, genre):
-        """Скачивает музыку со страницы"""
-        duration_sec, audio_url = self.get_duration_and_audio_url(page_url)
-
-        if not audio_url:
-            print(f"Не найден аудио URL: {page_url}")
-            return None, None, 0
-
-        # Формируем имя файла с указанием жанра
-        filename = os.path.basename(audio_url)
-        if not filename.endswith(".mp3"):
-            filename += ".mp3"
-        
-        # Добавляем жанр к имени файла для удобства
-        genre_prefix = genre[:3].lower()
-        filename = f"{genre_prefix}_{filename}"
-        filepath = os.path.join(download_folder, filename)
-
-        # Скачиваем файл
-        print(f"Скачивание ({genre}, {duration_sec} сек): {filename}")
+def download_mp3(url: str, path: str, retries: int = 3) -> bool:
+    """
+    Скачивает MP3-файл по URL с повторными попытками.
+    
+    Args:
+        url: URL MP3 файла
+        path: Путь для сохранения
+        retries: Количество попыток
+    
+    Returns:
+        True если скачивание успешно, иначе False
+    """
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+    
+    for attempt in range(retries):
         try:
-            audio_response = self.session.get(audio_url, timeout=30)
-            if audio_response.status_code == 200:
-                with open(filepath, "wb") as f:
-                    f.write(audio_response.content)
-
-                if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-                    return filepath, filename, duration_sec
-                else:
-                    print(f"Файл не скачался или пустой: {filename}")
-                    return None, None, 0
+            print(f"Попытка {attempt + 1}/{retries}: скачивание {os.path.basename(path)}")
+            
+            resp = requests.get(url, headers=headers, timeout=(5, 30), stream=True)
+            resp.raise_for_status()
+            
+            # Проверяем размер файла
+            content_length = resp.headers.get('Content-Length')
+            if content_length and int(content_length) < 1024:  # Меньше 1KB
+                print(f"Файл слишком маленький: {content_length} байт")
+                return False
+            
+            # Скачиваем файл
+            with open(path, 'wb') as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            
+            # Проверяем, что файл создан и не пустой
+            if os.path.exists(path) and os.path.getsize(path) > 1024:
+                print(f"Успешно скачан: {os.path.basename(path)}")
+                return True
             else:
-                print(f"Ошибка HTTP {audio_response.status_code}: {audio_url}")
+                print(f"Файл не создан или пустой: {path}")
+                
+        except requests.exceptions.Timeout:
+            print(f"Таймаут при скачивании {url}")
+        except requests.exceptions.HTTPError as e:
+            print(f"HTTP ошибка при скачивании {url}: {e}")
+            if e.response.status_code == 404:
+                return False  # Не пытаться снова для 404
+        except requests.exceptions.RequestException as e:
+            print(f"Ошибка сети при скачивании {url}: {e}")
+        except IOError as e:
+            print(f"Ошибка записи файла {path}: {e}")
         except Exception as e:
-            print(f"Ошибка скачивания {filename}: {e}")
+            print(f"Неожиданная ошибка при скачивании {url}: {e}")
+        
+        # Пауза перед следующей попыткой
+        if attempt < retries - 1:
+            time.sleep(random.uniform(1, 3))
+    
+    return False
 
-        return None, None, 0
 
-    def download_music_by_genre(
-        self, download_folder, annotation_file, min_files=50, max_files=100
-    ):
-        """Основной метод скачивания музыки по жанрам"""
-        os.makedirs(download_folder, exist_ok=True)
-        
-        # Определяем количество файлов для скачивания
-        total_to_download = random.randint(min_files, max_files)
-        print(f"\nЦель: скачать {total_to_download} файлов (от {min_files} до {max_files})")
-        
-        # Получаем все доступные страницы с музыкой
-        print("\nПоиск доступной музыки на сайте...")
-        all_music_pages = self.get_music_pages()
-        
-        if not all_music_pages:
-            print("Не найдено страниц с музыкой!")
-            return annotation_file
-        
-        print(f"\nВсего найдено треков: {len(all_music_pages)}")
-        
-        # Создаем CSV файл для аннотации
-        with open(annotation_file, "w", newline="", encoding="utf-8") as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(
-                ["absolute_path", "relative_path", "filename", "genre", "duration_seconds"]
-            )
+def get_duration_from_url(url: str) -> str:
+    """
+    Получает примерную длительность из имени файла или возвращает 0.
+    
+    Args:
+        url: URL файла
+    
+    Returns:
+        Строка с длительностью (например, "3:45")
+    """
+    # Пытаемся извлечь длительность из имени файла
+    filename = os.path.basename(url)
+    match = re.search(r'(\d+)[_-]?sec', filename, re.IGNORECASE)
+    if match:
+        seconds = int(match.group(1))
+        minutes = seconds // 60
+        remaining_seconds = seconds % 60
+        return f"{minutes}:{remaining_seconds:02d}"
+    
+    # Или ищем числа в формате времени
+    match = re.search(r'(\d+)[_-]?min[_-]?(\d+)', filename, re.IGNORECASE)
+    if match:
+        minutes = int(match.group(1))
+        seconds = int(match.group(2))
+        return f"{minutes}:{seconds:02d}"
+    
+    # Или просто случайная длительность для примера
+    return f"{random.randint(2, 5)}:{random.randint(0, 59):02d}"
 
-            downloaded = 0
-            skipped = 0
+
+def process_genre(
+    genre: str, 
+    output_dir: str, 
+    csv_path: str,
+    min_files_per_genre: int = 5,
+    max_files_per_genre: int = 15,
+    max_pages: int = 3
+) -> int:
+    """
+    Обрабатывает один жанр.
+    
+    Args:
+        genre: Название жанра
+        output_dir: Папка для сохранения файлов
+        csv_path: Путь к CSV файлу
+        min_files_per_genre: Минимальное количество файлов на жанр
+        max_files_per_genre: Максимальное количество файлов на жанр
+        max_pages: Максимальное количество страниц для парсинга
+    
+    Returns:
+        Количество успешно скачанных файлов
+    """
+    print(f"\n{'='*60}")
+    print(f"Обрабатываем жанр: {genre}")
+    print(f"{'='*60}")
+    
+    all_urls: List[str] = []
+    
+    # Парсим несколько страниц
+    for page in range(1, max_pages + 1):
+        print(f"Парсинг страницы {page}...")
+        url = generate_url(genre, page)
+        html = get_html(url)
+        
+        if html:
+            page_urls = mp3_parse(html)
+            print(f"Найдено ссылок на странице {page}: {len(page_urls)}")
+            all_urls.extend(page_urls)
             
-            # Определяем жанр для каждой страницы
-            genre_for_page = {}
-            for page_url in all_music_pages:
-                for genre in self.genres:
-                    if f"/{genre}/" in page_url:
-                        genre_for_page[page_url] = genre
-                        break
-                if page_url not in genre_for_page:
-                    genre_for_page[page_url] = "unknown"
+            # Небольшая пауза между запросами
+            if page < max_pages:
+                time.sleep(random.uniform(1, 2))
+        else:
+            print(f"Не удалось загрузить страницу {page}")
+    
+    # Удаляем дубликаты
+    all_urls = list(dict.fromkeys(all_urls))
+    print(f"Всего уникальных ссылок для жанра {genre}: {len(all_urls)}")
+    
+    if not all_urls:
+        print(f"Для жанра {genre} ссылки не найдены!")
+        return 0
+    
+    # Выбираем случайные ссылки для скачивания
+    selected_urls: List[str] = random_urls(
+        all_urls, 
+        min_files_per_genre, 
+        max_files_per_genre
+    )
+    print(f"Выбрано для скачивания: {len(selected_urls)} ссылок")
+    
+    csv_data: List[List[str]] = []
+    downloaded_count = 0
+    
+    # Скачиваем выбранные файлы
+    for i, url in enumerate(selected_urls, 1):
+        # Создаем уникальное имя файла
+        base_name = os.path.basename(url)
+        safe_name = re.sub(r'[^\w\-.]', '_', base_name)  # Заменяем спецсимволы
+        filename = f"{genre}_{i:03d}_{safe_name}"
+        
+        # Если имя слишком длинное, укорачиваем
+        if len(filename) > 150:
+            name, ext = os.path.splitext(filename)
+            filename = name[:100] + ext
+        
+        filepath = os.path.join(output_dir, filename)
+        
+        # Пропускаем, если файл уже существует
+        if os.path.exists(filepath):
+            print(f"Файл уже существует: {filename}")
+        else:
+            print(f"[{i}/{len(selected_urls)}] Скачиваем: {filename}")
             
-            # Скачиваем файлы
-            for i, page_url in enumerate(all_music_pages):
-                if downloaded >= total_to_download:
-                    break
+            # Скачиваем файл
+            if download_mp3(url, filepath):
+                downloaded_count += 1
                 
-                genre = genre_for_page.get(page_url, "unknown")
-                print(f"\n--- Обработка {i + 1}/{len(all_music_pages)} ({genre}) ---")
+                # Получаем длительность
+                duration = get_duration_from_url(url)
                 
-                filepath, filename, duration = self.download_music_from_page(
-                    page_url, download_folder, genre
+                # Добавляем данные в CSV
+                abs_path = os.path.abspath(filepath)
+                rel_path = os.path.relpath(filepath, output_dir)
+                csv_data.append([
+                    genre,
+                    abs_path,
+                    rel_path,
+                    url,
+                    filename,
+                    duration
+                ])
+            else:
+                print(f"Не удалось скачать: {filename}")
+        
+        # Пауза между скачиваниями
+        if i < len(selected_urls):
+            time.sleep(random.uniform(0.5, 1.5))
+    
+    # Записываем данные в CSV
+    if csv_data:
+        try:
+            append_to_csv(csv_path, csv_data)
+            print(f"Данные для жанра {genre} записаны в CSV")
+        except Exception as e:
+            print(f"Ошибка при записи в CSV для жанра {genre}: {e}")
+    
+    return downloaded_count
+
+
+def distribute_files_by_genre(
+    total_files: int, 
+    genres: List[str], 
+    min_per_genre: int = 1
+) -> Dict[str, int]:
+    """
+    Распределяет общее количество файлов по жанрам.
+    
+    Args:
+        total_files: Общее количество файлов
+        genres: Список жанров
+        min_per_genre: Минимальное количество файлов на жанр
+    
+    Returns:
+        Словарь с распределением по жанрам
+    """
+    # Гарантируем минимум для каждого жанра
+    distribution = {genre: min_per_genre for genre in genres}
+    allocated = min_per_genre * len(genres)
+    
+    # Распределяем оставшиеся файлы случайным образом
+    remaining = total_files - allocated
+    if remaining > 0:
+        # Генерируем случайные веса для жанров
+        weights = [random.random() for _ in genres]
+        total_weight = sum(weights)
+        
+        for i, genre in enumerate(genres):
+            additional = int(remaining * (weights[i] / total_weight))
+            distribution[genre] += additional
+        
+        # Корректируем округление
+        current_total = sum(distribution.values())
+        while current_total < total_files:
+            genre = random.choice(genres)
+            distribution[genre] += 1
+            current_total += 1
+    
+    print("\nРаспределение файлов по жанрам:")
+    for genre, count in distribution.items():
+        print(f"  {genre}: {count} файлов")
+    
+    return distribution
+
+
+def main() -> None:
+    """
+    Основная функция программы.
+    """
+    try:
+        # Парсим аргументы
+        args = parse_args()
+        
+        # Создаем выходную директорию
+        os.makedirs(args.output_dir, exist_ok=True)
+        print(f"Выходная директория: {args.output_dir}")
+        
+        # Инициализируем CSV файл
+        csv_init(args.csv_path)
+        print(f"CSV файл: {args.csv_path}")
+        
+        # Определяем жанры
+        genres = ['country', 'funk', 'classical']
+        
+        # Определяем общее количество файлов для скачивания
+        total_to_download = random.randint(args.min_files, args.max_files)
+        print(f"\nЦель: скачать {total_to_download} файлов")
+        print(f"Диапазон: от {args.min_files} до {args.max_files} файлов")
+        
+        # Распределяем файлы по жанрам
+        distribution = distribute_files_by_genre(total_to_download, genres)
+        
+        total_downloaded = 0
+        
+        # Обрабатываем каждый жанр
+        for genre in genres:
+            files_to_download = distribution.get(genre, 0)
+            if files_to_download > 0:
+                downloaded = process_genre(
+                    genre=genre,
+                    output_dir=args.output_dir,
+                    csv_path=args.csv_path,
+                    min_files_per_genre=files_to_download,
+                    max_files_per_genre=files_to_download,
+                    max_pages=args.max_pages
                 )
-
-                if filepath and os.path.exists(filepath):
-                    absolute_path = os.path.abspath(filepath)
-                    relative_path = os.path.relpath(filepath, download_folder)
-                    
-                    writer.writerow(
-                        [absolute_path, relative_path, filename, genre, duration]
-                    )
-                    downloaded += 1
-                    print(f"Сохранён: {filename} ({duration} сек) [{downloaded}/{total_to_download}]")
-                else:
-                    skipped += 1
-                    print("Пропущен или ошибка загрузки")
-
-                # Случайная задержка между запросами
-                time.sleep(random.uniform(1, 3))
-
-        print(f"\nЗавершено!")
-        print(f"Скачано файлов: {downloaded}")
-        print(f"Пропущено файлов: {skipped}")
+                total_downloaded += downloaded
+                print(f"Для жанра {genre} скачано: {downloaded}/{files_to_download} файлов")
         
-        if downloaded < min_files:
-            print(f"Внимание: скачано меньше минимального количества ({min_files})")
+        # Выводим итоговую статистику
+        print(f"\n{'='*60}")
+        print("ИТОГИ:")
+        print(f"{'='*60}")
+        print(f"Всего скачано файлов: {total_downloaded}")
+        print(f"Целевое количество: {total_to_download}")
         
-        # Подсчитываем статистику по жанрам
-        if os.path.exists(annotation_file):
-            self.calculate_genre_statistics(annotation_file)
+        if total_downloaded < total_to_download:
+            print(f"Внимание: скачано меньше целевого количества на {total_to_download - total_downloaded} файлов")
         
-        return annotation_file
-
-    def calculate_genre_statistics(self, annotation_file):
-        """Подсчитывает статистику по жанрам"""
-        genre_count = {genre: 0 for genre in self.genres}
-        genre_count["unknown"] = 0
+        # Демонстрация итератора
+        print(f"\n{'='*60}")
+        print("ДЕМОНСТРАЦИЯ ИТЕРАТОРА:")
+        print(f"{'='*60}")
         
         try:
-            with open(annotation_file, "r", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                next(reader, None)  # пропуск заголовка
-                for row in reader:
-                    if row and len(row) >= 4:
-                        genre = row[3]
-                        if genre in genre_count:
-                            genre_count[genre] += 1
-                        else:
-                            genre_count["unknown"] += 1
+            iterator = FileIterator(args.output_dir)
+            file_count = len(iterator)
+            print(f"Всего MP3 файлов в директории: {file_count}")
             
-            print("\nСтатистика по жанрам:")
-            for genre, count in genre_count.items():
-                if count > 0:
-                    print(f"  {genre}: {count} файлов")
-                    
+            if file_count > 0:
+                print("\nПервые 5 файлов:")
+                iterator.reset()
+                for i, file_path in enumerate(iterator):
+                    if i < 5:
+                        print(f"  {i+1}. {os.path.basename(file_path)}")
+                    else:
+                        break
+                if file_count > 5:
+                    print("  ...")
+            else:
+                print("В директории нет MP3 файлов")
+                
         except Exception as e:
-            print(f"Ошибка при подсчете статистики: {e}")
+            print(f"Ошибка при работе с итератором: {e}")
+        
+        print(f"\nПрограмма завершена успешно!")
+        print(f"Файлы сохранены в: {args.output_dir}")
+        print(f"Аннотации сохранены в: {args.csv_path}")
+        
+    except KeyboardInterrupt:
+        print("\n\nПрограмма прервана пользователем")
+        sys.exit(0)
+    except argparse.ArgumentError as e:
+        print(f"Ошибка аргументов: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\nОшибка при выполнении программы: {e}")
+        print(f"\nДетали ошибки:")
+        traceback.print_exc()
+        sys.exit(1)
 
 
-class MusicIterator:
-    def __init__(self, annotation_source):
-        """Итератор по аудиофайлам. Принимает путь к CSV или папке."""
-        self.file_paths = []
-
-        if os.path.isfile(annotation_source):
-            # Загрузка из CSV
-            with open(annotation_source, "r", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                next(reader, None)  # пропуск заголовка
-                for row in reader:
-                    if row and len(row) > 0:
-                        abs_path = row[0]
-                        if os.path.exists(abs_path):
-                            self.file_paths.append(abs_path)
-            print(f"Загружено {len(self.file_paths)} путей из аннотации")
-        elif os.path.isdir(annotation_source):
-            # Загрузка из папки
-            for root, _, files in os.walk(annotation_source):
-                for file in files:
-                    if file.lower().endswith((".mp3", ".wav", ".ogg", ".m4a")):
-                        self.file_paths.append(os.path.join(root, file))
-            print(f"Загружено {len(self.file_paths)} файлов из папки")
-        else:
-            raise ValueError(
-                f"Укажите существующий CSV-файл или папку: {annotation_source}"
-            )
-
-    def __iter__(self):
-        self._index = 0
-        return self
-
-    def __next__(self):
-        if self._index < len(self.file_paths):
-            path = self.file_paths[self._index]
-            self._index += 1
-            return path
-        else:
-            raise StopIteration
-
-    def __len__(self):
-        return len(self.file_paths)
-
-
-def main():
-    """Основная функция программы"""
-    # Парсим аргументы командной строки
-    args = parse_arguments()
-
-    # Скачивание музыки
-    downloader = MusicDownloader()
-    annotation_path = downloader.download_music_by_genre(
-        download_folder=args.download_folder,
-        annotation_file=args.annotation_file,
-        min_files=args.min_files,
-        max_files=args.max_files,
-    )
-
-    # Демонстрация итератора
-    if annotation_path and os.path.exists(annotation_path):
-        print("\n" + "=" * 50)
-        print("Демонстрация работы итератора:")
-        print("=" * 50)
-
-        iterator = MusicIterator(annotation_path)
-        print(f"Всего файлов для итерации: {len(iterator)}")
-
-        print("\nПервые 5 файлов:")
-        for i, path in enumerate(iterator):
-            if i < 5:
-                print(f"{i + 1}: {os.path.basename(path)}")
-
-        print("...")
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
