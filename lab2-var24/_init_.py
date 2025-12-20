@@ -11,9 +11,6 @@ from .utils import (
     distribute_files_by_genre
 )
 
-__version__ = "1.0.0"
-__author__ = "Music Downloader Team"
-
 __all__ = [
     'MusicDownloader',
     'FileIterator',
